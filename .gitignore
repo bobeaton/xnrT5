@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.dll
+*.pyd
+
+# Virtual environment directories
+venv/
+env/
+.env/
+.venv/
+.python_env/
+Lib/
+Include/
+Scripts/
+bin/
+lib/
+# If your venv is in a subfolder, list it:
+venv312/
+# VSCode workspace settings
+.vscode/
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+/import torch.py
