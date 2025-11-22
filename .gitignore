@@ -27,3 +27,4 @@ dist/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 /import torch.py
+/.vs

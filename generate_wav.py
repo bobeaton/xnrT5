@@ -27,7 +27,6 @@ class Config:
     clip_seconds: float = 3.0
     clips: int = 3
     commit: Optional[str] = None
-    orthography: Optional[str] = None
     max_words: int = 40
     sr: int = 16000
     text_col: str = "text"
@@ -84,7 +83,6 @@ xnr_a = Config(
     clip_seconds=3.0,
     clips=3,
     commit="7689c758a9d1300dddd97e2bed75f0047650871c",
-    orthography="a",
     text_col="text_a",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\KangriWordDownloads",
     prefix="XNR-",
@@ -98,16 +96,43 @@ xnr_b = Config(
     clip_seconds=3.0,
     clips=3,
     commit="c3606074764ba6cc6ef51a2e46076af2a47b62b4",
-    orthography="b",
     text_col="text_b",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\KangriWordDownloads",
     prefix="XNR-",
     input_path=r"C:\btmp\SpeecheloCleanInLinesNormalized.txt"
 )
 
+dgo_a = Config(
+    model_name="sil-ai/dgo-tts-training-data-a-speecht5",
+    dataset_name="sil-ai/dgo-tts-training-data",
+    speaker_index=285,
+    clip_seconds=3.0,
+    clips=3,
+    commit="8ebc0aa1003b602a3b648802602334c734b33ae9",
+    text_col="text_a",
+    folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\DogriWordDownloads",
+    prefix="DOG-",
+    input_path=r"C:\btmp\SpeecheloCleanInLines.txt"
+)
+
+dgo_b = Config(
+    model_name="sil-ai/dgo-tts-training-data-b-speecht5",
+    dataset_name="sil-ai/dgo-tts-training-data",
+    speaker_index=285,
+    clip_seconds=3.0,
+    clips=3,
+    commit="3cf20df9bbc61fde0737ab34cd10de0012c90898",
+    text_col="text_b",
+    folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\DogriWordDownloads",
+    prefix="DOG-",
+    input_path=r"C:\btmp\SpeecheloCleanInLinesNormalized.txt"
+)
+
 CONFIG_MAP = {
     "xnr_a": xnr_a,
     "xnr_b": xnr_b,
+    "dgo_a": dgo_a,
+    "dgo_b": dgo_b
 }
 
 def main(max_words = 20):  # max is 600, but the join adds spaces, so use something less
