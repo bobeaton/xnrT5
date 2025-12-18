@@ -22,7 +22,14 @@ class TTSEngine:
             print(f"⚠ WARNING: No CUDA GPU found. The process will run on the CPU.")
 
         self.config = config
-        self.speaker_embedding = self.create_speaker_embedding(dataset_name=config.dataset_name, num_samples=config.num_samples, aggregate="mean", index=config.speaker_index, clip_seconds=config.clip_seconds, speaker_model_type=config.speaker_model_type, crops=config.clips)
+        if config.speaker_indices is None:  # create the speaker_embedding for the single index once here
+            self.speaker_embedding = self.create_speaker_embedding(dataset_name=config.dataset_name, 
+                                        num_samples=config.num_samples, 
+                                        aggregate="mean", 
+                                        index=config.speaker_index, 
+                                        clip_seconds=config.clip_seconds, 
+                                        speaker_model_type=config.speaker_model_type, 
+                                        crops=config.clips)
 
         self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(self.device)
         if config.commit:
@@ -56,7 +63,7 @@ class TTSEngine:
             num_samples=1,
             hf_token=None,
             sr=16000,
-            clip_seconds=5.0,
+            clip_seconds=3.0,
             center=False,
             crops=3,
             aggregate="median",
@@ -64,12 +71,22 @@ class TTSEngine:
         ):
         import torch
         from torch.nn.utils.rnn import pad_sequence
-        from datasets import Audio, load_dataset
+        from datasets import load_dataset, Audio
         from speechbrain.inference import EncoderClassifier
 
-        ds = load_dataset(dataset_name, split="train", token=hf_token)
+        ds = load_dataset(
+            dataset_name,
+            split=f"train[{index}:{index+num_samples}]",
+            token=hf_token,
+        )
         ds = ds.cast_column("audio", Audio(decode=True, sampling_rate=sr))
-        seg = ds.select(range(index, index+num_samples))
+        
+        # Ensure we only select as many examples as were actually loaded
+        loaded_count = len(ds)
+        if loaded_count == 0:
+            raise ValueError(f"Loaded dataset slice contains no rows (requested index {index} num_samples {num_samples}).")
+        take_n = min(num_samples, loaded_count)
+        seg = ds.select(range(0, take_n))
 
         waves, lengths, per_counts = [], [], []
         L = int(sr*clip_seconds)
@@ -95,7 +112,7 @@ class TTSEngine:
         batch = pad_sequence(waves, batch_first=True)
         rel = torch.tensor(lengths, dtype=torch.float32); rel = rel/rel.max().clamp_min(1)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu" 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         model = EncoderClassifier.from_hparams(
             source=f"speechbrain/spkrec-{speaker_model_type}-voxceleb",
             run_opts={"device": device},
@@ -118,19 +135,126 @@ class TTSEngine:
         
     def run_inference(self, text_prompt):
         print(f"Running TTS inference on device: {self.device} for: {text_prompt}")
+
+        # If the sentence isn't roman script, print the romanizedversion
+        romanized = uroman.romanize_string(text_prompt.strip())
+        print(f"Romanized: {romanized}")
+
         inputs = self.processor(text=text_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self.device)
         speaker_embedding = torch.tensor(self.speaker_embedding).unsqueeze(0).to(self.device)
 
-        spectrogram = self.model.generate_speech(input_ids, speaker_embedding)
+        spectrogram = self.model.generate_speech(input_ids, speaker_embedding, threshold=0.01)
         # print(f"Generated spectrogram shape: {spectrogram.shape}")
         with torch.no_grad():
             speech = self.vocoder(spectrogram)
         # print(f"Generated speech shape: {speech.shape}")
         return speech.cpu().numpy()
 
+    def set_speaker_index(self, index: int):
+        """Recompute the speaker embedding for a different speaker index.
+
+        This avoids reloading the model/vocoder and only recomputes the
+        speaker embedding used for inference.
+        """
+        print(f"Setting speaker index to: {index} and recomputing embedding")
+        self.speaker_embedding = self.create_speaker_embedding(
+            dataset_name=self.config.dataset_name,
+            num_samples=self.config.num_samples,
+            aggregate="mean",
+            index=index,
+            clip_seconds=self.config.clip_seconds,
+            speaker_model_type=self.config.speaker_model_type,
+            crops=self.config.clips,
+        )
+
     def check_tokenization(self, text):
         print(self.tokenizer.tokenize(text))
+
+
+def export_dataset_metadata(
+    dataset_name: str,
+    split: str = "train",
+    out_csv: str = "dataset_metadata.csv",
+    fields: list | None = None,
+    hf_token: str | None = None,
+    max_rows: int | None = None,
+):
+    """Export a CSV mapping dataset indices -> selected fields.
+
+    This is a lightweight helper to inspect what examples live at which
+    zero-based indices in a HuggingFace `datasets` dataset split. It does
+    NOT initialize or depend on the TTSEngine and so avoids loading models.
+
+    Parameters
+    - dataset_name: HF dataset id (e.g. "sil-ai/xnr-tts-training-data")
+    - split: split string, typically "train"
+    - out_csv: destination CSV file path
+    - fields: list of field names to include. If None, attempts to include
+      a reasonable default (text, audio, id if present).
+    - hf_token: optional HF token
+    - max_rows: optional limit to number of rows to export (useful for large datasets)
+
+    The CSV will contain a leading `index` column (zero-based) followed by
+    the requested fields. For audio columns that are dict-like, the function
+    will try to write a path/filename if present; otherwise it will write a
+    short repr.
+    """
+    import csv
+    from datasets import load_dataset
+
+    print(f"Loading dataset {dataset_name} split={split} (this may take some time)")
+    ds = load_dataset(dataset_name, split=split, token=hf_token)
+
+    # Decide which fields to write
+    available = ds.column_names
+    if fields is None:
+        cand = []
+        for f in ("text", "sentence", "transcript", "utterance"):
+            if f in available:
+                cand.append(f)
+                break
+        # audio/id fallbacks
+        if "audio" in available:
+            cand.append("audio")
+        if "id" in available:
+            cand.append("id")
+        fields = cand if cand else available[:3]
+
+    print(f"Exporting fields: index + {fields} -> {out_csv}")
+
+    def _field_value(example, fname):
+        v = example.get(fname, None)
+        if v is None:
+            return ""
+        # if Audio column (dict-like with path)
+        if isinstance(v, dict):
+            # common keys: 'path', 'audio', 'array', 'file'
+            for k in ("path", "file", "filename", "audio"):
+                if k in v:
+                    return v[k]
+            # if it contains an 'array', return length
+            if "array" in v:
+                return f"<audio_array len={len(v['array'])}>"
+            return str(v)
+        # fallback: primitive or list
+        try:
+            return str(v)
+        except Exception:
+            return repr(v)
+
+    with open(out_csv, "w", encoding="utf-8", newline="") as csvf:
+        writer = csv.writer(csvf)
+        writer.writerow(["index"] + fields)
+        for i, ex in enumerate(ds):
+            if max_rows is not None and i >= max_rows:
+                break
+            row = [i]
+            for f in fields:
+                row.append(_field_value(ex, f))
+            writer.writerow(row)
+
+    print(f"Wrote {out_csv}")
 
 # Put whatever text you want here
 # xnr text sample

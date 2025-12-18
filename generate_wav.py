@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import os
 import sys
-from typing import Optional
+from typing import Optional, List
 
 if os.name == 'nt':
     import msvcrt
@@ -23,11 +23,12 @@ class Config:
     model_name: str
     dataset_name: str
     speaker_index: int
-    num_samples: int = 10
+    speaker_indices: Optional[List[int]] = None
+    num_samples: int = 1
     clip_seconds: float = 3.0
     clips: int = 3
     commit: Optional[str] = None
-    max_words: int = 40
+    max_words: int = 20
     sr: int = 16000
     text_col: str = "text"
     speaker_model_type: str="xvect"
@@ -35,54 +36,13 @@ class Config:
     prefix: str = None
     input_path: str = None
 
-# LANG_MAP = {
-#     "ENG": {
-#         "folder": r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\EnglishDownloads",
-#         "model": "facebook/mms-tts-en",
-#         "prefix": "ENG-",
-#         "snapshot": r"C:\Users\pete_\.cache\huggingface\hub\models--facebook--mms-tts-en\snapshots\<your-snapshot-id>"
-#     },
-#     "XNR": {
-#         "folder": r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\KangriWordDownloads",
-#         "model": "facebook/mms-tts-xnr",
-#         "prefix": "XNR-",
-#         "snapshot": r"C:\Users\pete_\.cache\huggingface\hub\models--facebook--mms-tts-xnr\snapshots\7aa0e29aa0a30d2abf5553581c237bf3573b50fd",
-#         "model_name": "sil-ai/xnr-tts-training-data-speecht5",
-#         "dataset_name": "sil-ai/xnr-tts-training-data",
-#         "commit": "a3d5c09d8a85d49a14a594623c205dd07f13650a",
-#         "speaker_index": 6
-#     },
-#     "DOG": {
-#         "folder": r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\DogriWordDownloads",
-#         "model": "facebook/mms-tts-dgo",
-#         "prefix": "DOG-",
-#         "snapshot": r"C:\Users\pete_\.cache\huggingface\hub\models--facebook--mms-tts-dgo\snapshots\<your-snapshot-id>",
-#         "model_name": "sil-ai/dgo-tts-training-data-speecht5",
-#         "dataset_name": "sil-ai/dgo-tts-training-data",
-#         "commit": "503eb0135e9c88d2f187dc4311b4134d04d0aae7",
-#         "speaker_index": 285
-#     },
-#     "DGOHIN": {
-#         "folder": r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\HindustaniWordDownloads",
-#         "model": "facebook/mms-tts-hin",
-#         "prefix": "DGOHIN-",
-#         "snapshot": r"C:\Users\pete_\.cache\huggingface\hub\models--facebook--mms-tts-hin\snapshots\<your-snapshot-id>"
-#     },
-#     "HIN": {
-#         "folder": r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\HindiWordDownloads",
-#         "model": "facebook/mms-tts-hin",
-#         "prefix": "HIN-",
-#         "snapshot": r"C:\Users\pete_\.cache\huggingface\hub\models--facebook--mms-tts-hin\snapshots\<your-snapshot-id>"
-#     }
-# }
-
 xnr_a = Config(
-    model_name="sil-ai/xnr-tts-training-data-a-speecht5",
+    model_name="sil-ai/xnr-tts-training-data-speecht5-a",
+    commit="021efeb612e98eb8feecb45e69f982168a5de38a",
     dataset_name="sil-ai/xnr-tts-training-data",
     speaker_index=6,
     clip_seconds=3.0,
     clips=3,
-    commit="7689c758a9d1300dddd97e2bed75f0047650871c",
     text_col="text_a",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\KangriWordDownloads",
     prefix="XNR-",
@@ -90,12 +50,15 @@ xnr_a = Config(
 )
 
 xnr_b = Config(
-    model_name="sil-ai/xnr-tts-training-data-b-speecht5",
+    model_name="sil-ai/xnr-tts-training-data-speecht5-b",
+    commit="397434c2bd9d8a8c939a956309a91c415549b8e4",
     dataset_name="sil-ai/xnr-tts-training-data",
+    # Example: multiple speaker indices to iterate over when producing outputs
+    # `speaker_indices` expects a list of integers
     speaker_index=6,
+    speaker_indices=[6,6782,7148,791,5550,5689,1499,5595,5202,4422,3976,3706,6427,5083,5429,1019,6547,7495,4515,3680,2517],
     clip_seconds=3.0,
     clips=3,
-    commit="c3606074764ba6cc6ef51a2e46076af2a47b62b4",
     text_col="text_b",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\KangriWordDownloads",
     prefix="XNR-",
@@ -103,12 +66,13 @@ xnr_b = Config(
 )
 
 dgo_a = Config(
-    model_name="sil-ai/dgo-tts-training-data-a-speecht5",
+    model_name="sil-ai/dgo-tts-training-data-speecht5-a",
+    commit="f07447080bee98d1d4cb5036191fd2f145fb3fe5",
     dataset_name="sil-ai/dgo-tts-training-data",
-    speaker_index=285,
-    clip_seconds=3.0,
-    clips=3,
-    commit="8ebc0aa1003b602a3b648802602334c734b33ae9",
+    speaker_index=1000,
+    # speaker_indices=[285,1000],
+    clip_seconds=5.0,
+    clips=1,
     text_col="text_a",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\DogriWordDownloads",
     prefix="DOG-",
@@ -116,12 +80,13 @@ dgo_a = Config(
 )
 
 dgo_b = Config(
-    model_name="sil-ai/dgo-tts-training-data-b-speecht5",
+    model_name="sil-ai/dgo-tts-training-data-speecht5-b",
+    commit="8a86d8deca49865e4a7eb776a826dcc3d757ade7",
     dataset_name="sil-ai/dgo-tts-training-data",
-    speaker_index=285,
-    clip_seconds=3.0,
-    clips=3,
-    commit="3cf20df9bbc61fde0737ab34cd10de0012c90898",
+    speaker_index=1000, #285, #1000,
+    # speaker_indices=[285,1000],
+    clip_seconds=5.0,
+    clips=1,
     text_col="text_b",
     folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\DogriWordDownloads",
     prefix="DOG-",
@@ -135,7 +100,7 @@ CONFIG_MAP = {
     "dgo_b": dgo_b
 }
 
-def main(max_words = 20):  # max is 600, but the join adds spaces, so use something less
+def main():
     import logging
     import traceback
     import numpy as np
@@ -147,10 +112,12 @@ def main(max_words = 20):  # max is 600, but the join adds spaces, so use someth
     print("Starting generate_wav.py (print statement)")
 
     try:
-        if len(sys.argv) != 2:
-            print("Usage: python generate_wav.py <config_name> (i.e. xnr_a or xnr_b)")
+        if len(sys.argv) < 2:
+            print("Usage: python generate_wav.py <config_name> [--save_chunks]")
             sys.exit(1)
         config_name = sys.argv[1]  # This is a string like "xnr_a" or "xnr_b"
+        # optional flag to save each inferred chunk as a separate wav
+        save_chunks = any(a in ("--save_chunks", "save_chunks") for a in sys.argv[2:])
 
         config = CONFIG_MAP.get(config_name)
         if not config:
@@ -181,7 +148,7 @@ def main(max_words = 20):  # max is 600, but the join adds spaces, so use someth
 
             if not process_files:
                 print("No process instruction file found, skipping.")
-                time.sleep(2)
+                time.sleep(10)
                 continue
 
             # 2. Pick the first matching file (or handle multiples if needed)
@@ -228,6 +195,9 @@ def main(max_words = 20):  # max is 600, but the join adds spaces, so use someth
                 with open(input_path , "r", encoding="utf-8") as f:
                     lines = [line.strip() for line in f if line.strip()]
 
+                # Build chunks for the entire file first (so we can process
+                # the whole file for each speaker before switching speakers).
+                all_text_chunks = []
                 for text in lines:
                     text = re.sub(r'\s+', ' ', text.strip())
 
@@ -262,16 +232,52 @@ def main(max_words = 20):  # max is 600, but the join adds spaces, so use someth
                             current_word_count += sentence_word_count
                     if current_chunk:
                         text_chunks.append(' '.join(current_chunk))
-                    for chunk in text_chunks:
-                        speech = tts.run_inference(chunk)
-                        all_audio.append(speech)
-                        
-                # Combine all audio and save
-                full_audio = np.concatenate(all_audio)
-                audio_int16 = np.int16(full_audio / np.max(np.abs(full_audio)) * 32767)
-                wavfile.write(filename, config.sr, audio_int16)
-                print(f"Saved combined audio to: {filename}")
 
+                    all_text_chunks.extend(text_chunks)
+
+                # If multiple speaker indices specified, process the entire
+                # collection of chunks for each speaker before moving on.
+                # Determine speaker list: either explicit indices or single config value
+                if config.speaker_indices:
+                    speaker_list = config.speaker_indices
+                else:
+                    speaker_list = [config.speaker_index]
+
+                for spk in speaker_list:
+                    print(f"Processing speaker index: {spk}")
+                    tts.set_speaker_index(spk)
+                    spk_audio = []
+                    for ci, chunk in enumerate(all_text_chunks):
+                        speech = tts.run_inference(chunk)
+                        spk_audio.append(speech)
+                        # Optionally save each chunk as an individual wav
+                        if save_chunks:
+                            # speech may be shaped (1, N) or (N,), normalize and save
+                            sp = np.asarray(speech).squeeze()
+                            if sp.size == 0:
+                                continue
+                            maxv = np.max(np.abs(sp))
+                            if maxv == 0:
+                                audio_int16 = np.int16(sp)
+                            else:
+                                audio_int16 = np.int16(sp / maxv * 32767)
+                            # 1-based chunk index
+                            chunk_idx = ci + 1
+                            filename_chunk = filename[:-4] + f"_{spk}_{chunk_idx:02d}.wav"
+                            wavfile.write(filename_chunk, config.sr, audio_int16)
+                            print(f"Saved chunk {chunk_idx} to: {filename_chunk}")
+
+                    # After all chunks for this speaker, combine and write full file
+                    full_audio_spk = np.concatenate(spk_audio)
+                    audio_int16 = np.int16(full_audio_spk / np.max(np.abs(full_audio_spk)) * 32767)
+                    # If multiple speakers, append speaker index to filename
+                    if len(speaker_list) > 1:
+                        filename_spk = filename[:-4] + f"_{spk}.wav"
+                    else:
+                        filename_spk = filename
+                    wavfile.write(filename_spk, config.sr, audio_int16)
+                    print(f"Saved combined audio to: {filename_spk}")
+                
                 # --- Processing Logic End ---
 
                 # Create marker file
@@ -280,7 +286,7 @@ def main(max_words = 20):  # max is 600, but the join adds spaces, so use someth
 
                 last_processed_time = mtime
 
-            time.sleep(2)  # Check every 2 seconds
+            time.sleep(10)  # Check every 10 seconds
 
     except Exception as e:
         print("An exception occurred:")
