@@ -258,110 +258,86 @@ def preprocess_function(
     max_target_length: int = 8000,
 ):
     """Preprocess examples for SpeechT5 training."""
-    # Get texts and speakers
-    texts = examples[text_column]
-    speakers = examples[speaker_column]
 
     valid_texts = []
-    valid_speech = []
-    valid_embeddings = []
+    valid_speeches = []
+    valid_speaker_embeddings = []
 
-    for text, audiopath, speakerlabel in zip(texts, examples[audio_column], speakers):
+    for text, audio_path, speaker_label in zip(
+        examples[text_column],
+        examples[audio_column],
+        examples[speaker_column],
+    ):
         try:
-            if not os.path.exists(audiopath):
-                logger.warning(f"Audio not found: {audiopath}")
-                continue
-
-            waveform, file_sr = torchaudio.load(audiopath)
-            if file_sr != sr:
-                waveform = torchaudio.transforms.Resample(file_sr, sr)(waveform)
-
-            speech = waveform.squeeze(0).numpy()
-            if len(speech) > max_target_length:
-                speech = speech[:max_target_length]
-
-            if speakerlabel not in speaker_embeddings:
-                logger.warning(f"No embedding for speaker: {speakerlabel}")
-                continue
-
-            valid_texts.append(text)
-            valid_speech.append(speech)
-            valid_embeddings.append(speaker_embeddings[speakerlabel])
-
-        except Exception as e:
-            logger.warning(f"Error processing {audiopath}: {e}")
-            continue
-
-    if not valid_speech:
-        return None
-
-    # Process texts through tokenizer
-    inputs = processor(text=valid_texts, sampling_rate=sr, return_tensors="pt", padding=True)
-
-    # Load and process audio
-    batch_speech_values = []
-    batch_speaker_embeddings = []
-
-    for audio_path, speaker_label in zip(examples[audio_column], speakers):
-        try:
-            # Load audio
             if not os.path.exists(audio_path):
                 logger.warning(f"Audio not found: {audio_path}")
                 continue
 
+            if speaker_label not in speaker_embeddings:
+                logger.warning(f"No embedding for speaker: {speaker_label}")
+                continue
+
             waveform, file_sr = torchaudio.load(audio_path)
-            
-            # Resample if needed
+
             if file_sr != sr:
                 resampler = torchaudio.transforms.Resample(file_sr, sr)
                 waveform = resampler(waveform)
 
+            if waveform.ndim > 1 and waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
             speech = waveform.squeeze(0).numpy()
 
-            # Trim to max length
             if len(speech) > max_target_length:
                 speech = speech[:max_target_length]
 
-            batch_speech_values.append(speech)
-
-            # Get speaker embedding
-            if speaker_label in speaker_embeddings:
-                batch_speaker_embeddings.append(speaker_embeddings[speaker_label])
-            else:
-                logger.warning(f"No embedding for speaker: {speaker_label}")
+            valid_texts.append(text)
+            valid_speeches.append(speech)
+            valid_speaker_embeddings.append(speaker_embeddings[speaker_label])
 
         except Exception as e:
             logger.warning(f"Error processing {audio_path}: {e}")
             continue
 
-    if not batch_speech_values:
-        return None
+    if not valid_texts:
+        return {
+            "input_ids": [],
+            "attention_mask": [],
+            "speaker_embeddings": [],
+            "speech_values": [],
+        }
 
-    # Pad speech values
-    speech_values = processor(
-        audio=batch_speech_values,
+    text_inputs = processor(
+        text=valid_texts,
+        padding=True,
+        truncation=True,
+    ) # return_tensors="pt",
+
+    speech_inputs = processor(
+        audio=valid_speeches,
         sampling_rate=sr,
-        return_tensors="pt",
         padding=True,
         max_length=max_target_length,
         truncation=True,
+    ) # return_tensors="pt",
+
+    speech_key = "input_features" if "input_features" in speech_inputs else "input_values"
+
+    speaker_embeddings_tensor = torch.tensor(
+        np.array(valid_speaker_embeddings),
+        dtype=torch.float32,
     )
 
-    speech_key = "input_features" if "input_features" in speech_values else "input_values"
-
-    # Stack speaker embeddings
-    if batch_speaker_embeddings:
-        speaker_embeddings_tensor = torch.tensor(np.array(batch_speaker_embeddings), dtype=torch.float32)
-    else:
-        return None
-
-    return {
-        "input_ids": inputs["input_ids"],
-        "attention_mask": inputs.get("attention_mask"),
+    result = {
+        "input_ids": text_inputs["input_ids"],
         "speaker_embeddings": speaker_embeddings_tensor,
-        "speech_values": speech_values[speech_key],
+        "speech_values": speech_inputs[speech_key],
     }
 
+    if "attention_mask" in text_inputs:
+        result["attention_mask"] = text_inputs["attention_mask"]
+
+    return result
 
 def main():
     parser = argparse.ArgumentParser(
@@ -527,7 +503,7 @@ def main():
 
     logger.info(f"Loading SpeechT5 model: {args.model_name}")
     processor = SpeechT5Processor.from_pretrained(args.model_name)
-    model = SpeechT5ForTextToSpeech.from_pretrained(args.model_name, torch_dtype=torch.float16 if args.device == "cuda" else torch.float32)
+    model = SpeechT5ForTextToSpeech.from_pretrained(args.model_name, dtype=torch.float16 if args.device == "cuda" else torch.float32)
     vocoder = SpeechT5HifiGan.from_pretrained(args.vocoder_name)
 
     logger.info(f"Loading training dataset from: {train_path}")
@@ -561,9 +537,20 @@ def main():
         logger.info(f"Validation set size: {len(val_dataset)}")
 
     # Extract audio paths and speaker labels for embedding creation
+    # Include validation speakers as well so embeddings exist during eval
     logger.info("Extracting audio and speaker information...")
     train_audio_paths = [path for path in train_dataset[args.audio_column]]
     train_speaker_labels = [label for label in train_dataset[args.speaker_column]]
+    if val_dataset is not None:
+        try:
+            val_audio_paths = [path for path in val_dataset[args.audio_column]]
+            val_speaker_labels = [label for label in val_dataset[args.speaker_column]]
+            # Extend the lists so speaker embeddings are created for all speakers
+            train_audio_paths = train_audio_paths + val_audio_paths
+            train_speaker_labels = train_speaker_labels + val_speaker_labels
+        except Exception:
+            # If validation dataset doesn't have expected columns, ignore
+            logger.debug("Validation dataset missing expected audio/speaker columns; skipping extension of embedding list")
 
     # Create speaker embeddings
     speaker_embeddings = create_speaker_embeddings(
@@ -604,6 +591,7 @@ def main():
         batched=True,
         batch_size=8,
         desc="Processing training data",
+        remove_columns=train_dataset.column_names,
     )
 
     if val_dataset:
@@ -612,29 +600,56 @@ def main():
             batched=True,
             batch_size=8,
             desc="Processing validation data",
+            remove_columns=val_dataset.column_names,
         )
 
-    training_args = TrainingArguments(
-        output_dir=str(output_dir),
-        overwrite_output_dir=True,
-        num_train_epochs=args.num_epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.eval_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        warmup_steps=args.warmup_steps,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=3,
-        evaluation_strategy="steps" if val_dataset else "no",
-        save_strategy="steps",
-        seed=args.seed,
-        fp16=args.mixed_precision == "fp16",
-        bf16=args.mixed_precision == "bf16",
-        optim="adamw_8bit" if args.device == "cuda" else "adamw_torch",
-        report_to="tensorboard",
-    )
+    # TrainingArguments in some transformers versions may not accept
+    # `evaluation_strategy` as a constructor kwarg. Try to set it and
+    # fall back if the installed transformers is older.
+    try:
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            overwrite_output_dir=True,
+            num_train_epochs=args.num_epochs,
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.eval_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            logging_steps=args.logging_steps,
+            save_steps=args.save_steps,
+            save_total_limit=3,
+            evaluation_strategy="steps" if val_dataset else "no",
+            save_strategy="steps",
+            seed=args.seed,
+            fp16=args.mixed_precision == "fp16",
+            bf16=args.mixed_precision == "bf16",
+            optim="adamw_8bit" if args.device == "cuda" else "adamw_torch",
+            report_to="tensorboard",
+        )
+    except TypeError:
+        logger.warning("TrainingArguments() does not accept 'evaluation_strategy' in this transformers version; using fallback parameters.")
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            overwrite_output_dir=True,
+            num_train_epochs=args.num_epochs,
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.eval_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            logging_steps=args.logging_steps,
+            save_steps=args.save_steps,
+            save_total_limit=3,
+            save_strategy="steps",
+            seed=args.seed,
+            fp16=args.mixed_precision == "fp16",
+            bf16=args.mixed_precision == "bf16",
+            optim="adamw_8bit" if args.device == "cuda" else "adamw_torch",
+            report_to="tensorboard",
+        )
 
     logger.info("Initializing Trainer...")
     trainer = Trainer(
