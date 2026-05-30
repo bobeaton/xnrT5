@@ -4,5 +4,22 @@
 			"path": "."
 		}
 	],
-	"settings": {"python.defaultInterpreterPath": "${workspaceFolder}\\venv312\\Scripts\\python.exe"}
+	"settings": {"python.defaultInterpreterPath": "${workspaceFolder}\\venv312\\Scripts\\python.exe"},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Python: Debug generate_wav.py",
+				"type": "debugpy",
+				"request": "launch",
+				"program": "${workspaceFolder}/generate_wav.py",
+				"console": "integratedTerminal",
+				"args": [
+					"dgohin"
+				],
+				"env": {},
+				"cwd": "${workspaceFolder}"
+			}
+		]
+	}
 }

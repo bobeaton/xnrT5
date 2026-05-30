@@ -21,8 +21,9 @@ uroman = ur.Uroman()
 @dataclass
 class Config:
     model_name: str
-    dataset_name: str
-    speaker_index: int
+    tts_type: str  # "speecht5" or "generic_hf" or "vitsmodel"
+    dataset_name: str = None
+    speaker_index: int = None
     speaker_indices: Optional[List[int]] = None
     num_samples: int = 1
     clip_seconds: float = 3.0
@@ -37,8 +38,9 @@ class Config:
     input_path: str = None
 
 xnr_a = Config(
+    tts_type="speecht5",
     model_name="sil-ai/xnr-tts-training-data-speecht5-a",
-    commit="021efeb612e98eb8feecb45e69f982168a5de38a",
+    commit="afb4ef469bca8093ff4b974a54824e9b05ab1dd3",
     dataset_name="sil-ai/xnr-tts-training-data",
     speaker_index=6,
     clip_seconds=3.0,
@@ -50,13 +52,11 @@ xnr_a = Config(
 )
 
 xnr_b = Config(
+    tts_type="speecht5",
     model_name="sil-ai/xnr-tts-training-data-speecht5-b",
-    commit="397434c2bd9d8a8c939a956309a91c415549b8e4",
+    commit="795e6ed4b0b995b3ea064b648a6164521c8b75a7",
     dataset_name="sil-ai/xnr-tts-training-data",
-    # Example: multiple speaker indices to iterate over when producing outputs
-    # `speaker_indices` expects a list of integers
     speaker_index=6,
-    speaker_indices=[6,6782,7148,791,5550,5689,1499,5595,5202,4422,3976,3706,6427,5083,5429,1019,6547,7495,4515,3680,2517],
     clip_seconds=3.0,
     clips=3,
     text_col="text_b",
@@ -66,11 +66,11 @@ xnr_b = Config(
 )
 
 dgo_a = Config(
+    tts_type="speecht5",
     model_name="sil-ai/dgo-tts-training-data-speecht5-a",
     commit="f07447080bee98d1d4cb5036191fd2f145fb3fe5",
     dataset_name="sil-ai/dgo-tts-training-data",
     speaker_index=1000,
-    # speaker_indices=[285,1000],
     clip_seconds=5.0,
     clips=1,
     text_col="text_a",
@@ -80,11 +80,11 @@ dgo_a = Config(
 )
 
 dgo_b = Config(
+    tts_type="speecht5",
     model_name="sil-ai/dgo-tts-training-data-speecht5-b",
-    commit="8a86d8deca49865e4a7eb776a826dcc3d757ade7",
+    commit="dcda3ac3a4d0a66eb3b6fd86b9986e81644e13f4",
     dataset_name="sil-ai/dgo-tts-training-data",
-    speaker_index=1000, #285, #1000,
-    # speaker_indices=[285,1000],
+    speaker_index=1000,
     clip_seconds=5.0,
     clips=1,
     text_col="text_b",
@@ -93,11 +93,29 @@ dgo_b = Config(
     input_path=r"C:\btmp\SpeecheloCleanInLinesNormalized.txt"
 )
 
+dgohin = Config(
+    tts_type="vitsmodel",
+    model_name="facebook/mms-tts-hin",
+    folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\HindustaniWordDownloads",
+    prefix="DGOHIN-",
+    input_path=r"C:\btmp\SpeecheloCleanInLines.txt"
+)
+
+dgohinai = Config(
+    tts_type="vitsmodel",
+    model_name="facebook/mms-tts-hin",
+    folder=r"C:\Users\pete_\Dropbox\NTprogress\PahariAudio\HindustaniWordDownloads",
+    prefix="DGOHINAI-",
+    input_path=r"C:\btmp\SpeecheloCleanInLines.txt"
+)
+
 CONFIG_MAP = {
     "xnr_a": xnr_a,
     "xnr_b": xnr_b,
     "dgo_a": dgo_a,
-    "dgo_b": dgo_b
+    "dgo_b": dgo_b,
+    "dgohin": dgohin,
+    "dgohinai": dgohinai
 }
 
 def main():
@@ -161,6 +179,10 @@ def main():
 
             lang, book_num, book_name, chapter_num = match.groups()
 
+            if lang not in config.prefix:
+                print(f"Language code in process file '{lang}' does not match the expected config prefix '{config.prefix}'")
+                exit(1)
+
             # Proceed with the language map and filename as usual:
             # if lang not in LANG_MAP:
             #     print(f"Unknown language code: {lang}")
@@ -201,8 +223,8 @@ def main():
                 for text in lines:
                     text = re.sub(r'\s+', ' ', text.strip())
 
-                    # Split into sentences
-                    sentences = re.split(r'([.!?]+)', text)
+                    # Split into sentences (include Devanagari danda '।')
+                    sentences = re.split(r'([.!?।]+)', text)
 
                     # Recombine sentences with their punctuation
                     sentence_list = []
@@ -216,22 +238,67 @@ def main():
                     if len(sentences) % 2 == 1 and sentences[-1].strip():
                         sentence_list.append(sentences[-1].strip())
 
-                    # Group sentences by word count
+                    # Group sentences by word/phrase count, but when a sentence
+                    # itself exceeds max_words, split it only at punctuation
+                    # clause boundaries (commas, semicolons, colons, danda).
                     text_chunks = []
                     current_chunk = []
                     current_word_count = 0
 
-                    for sentence in sentence_list:
-                        sentence_word_count = len(sentence.split())
-                        if current_word_count + sentence_word_count > config.max_words and current_chunk:
+                    def emit_current_chunk():
+                        nonlocal current_chunk, current_word_count, text_chunks
+                        if current_chunk:
                             text_chunks.append(' '.join(current_chunk))
-                            current_chunk = [sentence]
-                            current_word_count = sentence_word_count
-                        else:
+                            current_chunk = []
+                            current_word_count = 0
+
+                    for sentence in sentence_list:
+                        sentence = sentence.strip()
+                        if not sentence:
+                            continue
+                        words = sentence.split()
+                        sentence_word_count = len(words)
+
+                        # If sentence fits within max_words, try to add to current chunk
+                        if sentence_word_count <= config.max_words:
+                            if current_word_count + sentence_word_count > config.max_words and current_chunk:
+                                emit_current_chunk()
                             current_chunk.append(sentence)
                             current_word_count += sentence_word_count
-                    if current_chunk:
-                        text_chunks.append(' '.join(current_chunk))
+                            continue
+
+                        # Sentence is too long: split on clause punctuation (commas, semicolons, colons, danda)
+                        clauses = re.split(r'([,;:।]+)', sentence)
+                        # join clause text with following punctuation where present
+                        joined_clauses = []
+                        i = 0
+                        while i < len(clauses):
+                            if i + 1 < len(clauses) and re.match(r'[,;:।]+', clauses[i + 1]):
+                                joined_clauses.append((clauses[i] + clauses[i + 1]).strip())
+                                i += 2
+                            else:
+                                joined_clauses.append(clauses[i].strip())
+                                i += 1
+
+                        for clause in joined_clauses:
+                            if not clause:
+                                continue
+                            cwords = clause.split()
+                            c_wc = len(cwords)
+                            if c_wc <= config.max_words:
+                                if current_word_count + c_wc > config.max_words and current_chunk:
+                                    emit_current_chunk()
+                                current_chunk.append(clause)
+                                current_word_count += c_wc
+                            else:
+                                # Clause still longer than max. Emit current chunk first,
+                                # then emit the long clause as its own chunk WITHOUT
+                                # splitting on raw word count (preserve punctuation boundaries).
+                                emit_current_chunk()
+                                text_chunks.append(clause)
+
+                    # flush remaining
+                    emit_current_chunk()
 
                     all_text_chunks.extend(text_chunks)
 
@@ -245,13 +312,18 @@ def main():
 
                 for spk in speaker_list:
                     print(f"Processing speaker index: {spk}")
-                    tts.set_speaker_index(spk)
+                    # If there is only one speaker in the list, the engine
+                    # was already initialized for that speaker; avoid
+                    # repeatedly calling set_speaker_index in that case.
+                    if len(speaker_list) > 1:
+                        tts.set_speaker_index(spk)
                     spk_audio = []
                     for ci, chunk in enumerate(all_text_chunks):
                         speech = tts.run_inference(chunk)
-                        spk_audio.append(speech)
+                        if speech is not None:
+                            spk_audio.append(speech)
                         # Optionally save each chunk as an individual wav
-                        if save_chunks:
+                        if save_chunks and speech is not None:
                             # speech may be shaped (1, N) or (N,), normalize and save
                             sp = np.asarray(speech).squeeze()
                             if sp.size == 0:
@@ -268,7 +340,12 @@ def main():
                             print(f"Saved chunk {chunk_idx} to: {filename_chunk}")
 
                     # After all chunks for this speaker, combine and write full file
-                    full_audio_spk = np.concatenate(spk_audio)
+                    if config.tts_type == "vitsmodel":
+                        # Flatten for vitsmodel due to variable output lengths
+                        full_audio_spk = np.concatenate([audio.flatten() for audio in spk_audio])
+                    else:
+                        # Keep original behavior for speecht5 and generic_hf
+                        full_audio_spk = np.concatenate(spk_audio)
                     audio_int16 = np.int16(full_audio_spk / np.max(np.abs(full_audio_spk)) * 32767)
                     # If multiple speakers, append speaker index to filename
                     if len(speaker_list) > 1:

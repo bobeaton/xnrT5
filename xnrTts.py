@@ -2,6 +2,7 @@
 
 import os
 import re
+import numpy as np
 
 from transformers import SpeechT5Tokenizer
 import uroman as ur
@@ -13,32 +14,72 @@ import torch
 
 class TTSEngine:
     def  __init__(self, config):
-        from transformers import SpeechT5ForTextToSpeech, SpeechT5Processor, SpeechT5HifiGan
         import torch
-        
+
         # print("Initializing TTS Engine...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         if not torch.cuda.is_available():
             print(f"⚠ WARNING: No CUDA GPU found. The process will run on the CPU.")
 
         self.config = config
-        if config.speaker_indices is None:  # create the speaker_embedding for the single index once here
-            self.speaker_embedding = self.create_speaker_embedding(dataset_name=config.dataset_name, 
-                                        num_samples=config.num_samples, 
-                                        aggregate="mean", 
-                                        index=config.speaker_index, 
-                                        clip_seconds=config.clip_seconds, 
-                                        speaker_model_type=config.speaker_model_type, 
-                                        crops=config.clips)
 
-        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(self.device)
-        if config.commit:
-            self.model = SpeechT5ForTextToSpeech.from_pretrained(config.model_name, revision=config.commit).to(self.device)
+        # Validate and use configured tts_type
+        if not hasattr(config, 'tts_type') or not config.tts_type:
+            raise ValueError("config.tts_type must be explicitly set to 'speecht5' or 'generic_hf'")
+
+        self.tts_type = config.tts_type
+
+        if self.tts_type == "speecht5":
+            self._init_speecht5()
+        elif self.tts_type == "generic_hf":
+            self._init_generic_hf()
+        elif self.tts_type == "vitsmodel":
+            self._init_vitsmodel()
         else:
-            self.model = SpeechT5ForTextToSpeech.from_pretrained(config.model_name).to(self.device)
-        self.processor = SpeechT5Processor.from_pretrained(config.model_name)
+            raise ValueError(f"Unknown tts_type: {self.tts_type}. Must be 'speecht5', 'generic_hf', or 'vitsmodel'  ")
+
+    def _init_speecht5(self):
+        """Initialize SpeechT5 model with vocoder and speaker embedding."""
+        from transformers import SpeechT5ForTextToSpeech, SpeechT5Processor, SpeechT5HifiGan
+
+        self.vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(self.device).float()
+        if self.config.commit:
+            self.model = SpeechT5ForTextToSpeech.from_pretrained(self.config.model_name, revision=self.config.commit).to(self.device).float()
+        else:
+            self.model = SpeechT5ForTextToSpeech.from_pretrained(self.config.model_name).to(self.device).float()
+        self.processor = SpeechT5Processor.from_pretrained(self.config.model_name)
         self.tokenizer = self.processor.tokenizer
-        
+
+        if self.config.speaker_indices is None:  # create the speaker_embedding for the single index once here
+            self.speaker_embedding = self.create_speaker_embedding(dataset_name=self.config.dataset_name,
+                                        num_samples=self.config.num_samples,
+                                        aggregate="mean",
+                                        index=self.config.speaker_index,
+                                        clip_seconds=self.config.clip_seconds,
+                                        speaker_model_type=self.config.speaker_model_type,
+                                        crops=self.config.clips)
+
+    def _init_vitsmodel(self):
+        """Initialize a VitsModel-based TTSHuggingFace TTS model without speaker embeddings or vocoder."""
+        from transformers import VitsModel, AutoTokenizer
+        import torch
+
+        self.model = VitsModel.from_pretrained(self.config.model_name).to(self.device).float()
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name)
+        self.processor = None
+        self.vocoder = None
+        self.speaker_embedding = None
+ 
+    def _init_generic_hf(self):
+        """Initialize a generic HuggingFace TTS model without speaker embeddings or vocoder."""
+        from transformers import AutoProcessor, AutoModel
+
+        self.processor = AutoProcessor.from_pretrained(self.config.model_name)
+        self.model = AutoModel.from_pretrained(self.config.model_name).to(self.device).float()
+        self.vocoder = None
+        self.speaker_embedding = None
+        self.tokenizer = None
+       
     @staticmethod
     def trim_silence_energy(x, sr, frame_ms=30, hop_ms=10, rel_db=-45.0, pad_ms=0):
             x = x.float();
@@ -69,6 +110,15 @@ class TTSEngine:
             aggregate="median",
             speaker_model_type="xvect"
         ):
+        if self.tts_type != "speecht5":
+            raise NotImplementedError(
+                f"create_speaker_embedding() is only supported for tts_type='speecht5'. "
+                f"Current tts_type is '{self.tts_type}'. "
+                f"Update config.tts_type to 'speecht5' if using a SpeechT5 model."
+            )
+
+        if dataset_name is None:
+            return None
         import torch
         from torch.nn.utils.rnn import pad_sequence
         from datasets import load_dataset, Audio
@@ -140,16 +190,112 @@ class TTSEngine:
         romanized = uroman.romanize_string(text_prompt.strip())
         print(f"Romanized: {romanized}")
 
+        if self.tts_type == "speecht5":
+            return self._inference_speecht5(text_prompt)
+        elif self.tts_type == "generic_hf":
+            return self._inference_generic_hf(text_prompt)
+        elif self.tts_type == "vitsmodel":
+            return self._inference_vitsmodel(text_prompt)
+        else:
+            raise ValueError(f"Unknown tts_type: {self.tts_type}. Must be 'speecht5', 'generic_hf', or 'vitsmodel'  ")
+
+
+    def _inference_speecht5(self, text_prompt):
+        """Run inference with SpeechT5 model."""
         inputs = self.processor(text=text_prompt, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self.device)
         speaker_embedding = torch.tensor(self.speaker_embedding).unsqueeze(0).to(self.device)
 
-        spectrogram = self.model.generate_speech(input_ids, speaker_embedding, threshold=0.01)
-        # print(f"Generated spectrogram shape: {spectrogram.shape}")
         with torch.no_grad():
+            spectrogram = self.model.generate_speech(input_ids, speaker_embedding, threshold=0.001)
+            print(f"Generated spectrogram shape: {spectrogram.shape}")
             speech = self.vocoder(spectrogram)
-        # print(f"Generated speech shape: {speech.shape}")
+
+        print(f"Generated speech shape: {speech.shape}")
         return speech.cpu().numpy()
+    
+    def _vitsmodel_inference_step(self, text_prompt):
+        """Helper function to run VitsModel inference on text.
+        
+        Returns numpy array of speech on success, raises exception on failure.
+        """
+        inputs = self.tokenizer(text_prompt, return_tensors="pt")
+        
+        # Move all input tensors to the device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Debug: check the input shape
+        print(f"Tokenized input_ids shape: {inputs.get('input_ids', 'N/A').shape if 'input_ids' in inputs else 'No input_ids'}")
+
+        with torch.no_grad():
+            outputs = self.model(**inputs).waveform
+
+        # Convert to numpy - outputs may be a tensor or an object with audio attribute
+        if hasattr(outputs, 'audio'):
+            # Some models return an object with audio attribute
+            speech = outputs.audio
+        else:
+            # Others return the waveform directly
+            speech = outputs
+
+        if hasattr(speech, 'cpu'):
+            speech = speech.cpu().numpy()
+        else:
+            speech = np.asarray(speech)
+
+        print(f"Generated speech shape: {speech.shape}")
+        return speech
+
+    def _inference_vitsmodel(self, text_prompt):
+        """Run inference with a VitsModel-based HuggingFace TTS model."""
+        try:
+            return self._vitsmodel_inference_step(text_prompt)
+        
+        except RuntimeError as e:
+            print(f"⚠ Inference failed, attempting to clean problematic characters: {e}")
+            # Try again with cleaned text (remove smart quotes and other problematic Unicode)
+            try:
+                cleaned_text = text_prompt
+                # Replace smart quotes with regular quotes
+                cleaned_text = cleaned_text.replace('“', None).replace('”', None)
+                cleaned_text = cleaned_text.replace('‘', None).replace('’', None)
+                # Remove other common problematic characters
+                # cleaned_text = cleaned_text.replace('–', '-').replace('—', '-')
+                
+                print(f"Retrying with cleaned text: {cleaned_text}")
+                if not cleaned_text.strip():
+                    print(f"⚠ Cleaned text is empty after removing problematic characters. Skipping inference.")
+                    return None
+                return self._vitsmodel_inference_step(cleaned_text)
+            
+            except Exception as retry_error:
+                print(f"⚠ Inference still failed after cleaning: {retry_error}")
+                print(f"Skipping this chunk")
+                # Return None to indicate this chunk should be skipped
+                return None
+
+    def _inference_generic_hf(self, text_prompt):
+        """Run inference with a generic HuggingFace TTS model."""
+        inputs = self.processor(text=text_prompt, return_tensors="pt")
+
+        with torch.no_grad():
+            outputs = self.model.generate(**{k: v.to(self.device) for k, v in inputs.items()})
+
+        # Convert to numpy - outputs may be a tensor or an object with audio attribute
+        if hasattr(outputs, 'audio'):
+            # Some models return an object with audio attribute
+            speech = outputs.audio
+        else:
+            # Others return the waveform directly
+            speech = outputs
+
+        if hasattr(speech, 'cpu'):
+            speech = speech.cpu().numpy()
+        else:
+            speech = np.asarray(speech)
+
+        print(f"Generated speech shape: {speech.shape}")
+        return speech
 
     def set_speaker_index(self, index: int):
         """Recompute the speaker embedding for a different speaker index.
@@ -157,6 +303,13 @@ class TTSEngine:
         This avoids reloading the model/vocoder and only recomputes the
         speaker embedding used for inference.
         """
+        if self.tts_type != "speecht5":
+            raise NotImplementedError(
+                f"set_speaker_index() is only supported for tts_type='speecht5'. "
+                f"Current tts_type is '{self.tts_type}'. "
+                f"Update config.tts_type to 'speecht5' if using a SpeechT5 model."
+            )
+
         print(f"Setting speaker index to: {index} and recomputing embedding")
         self.speaker_embedding = self.create_speaker_embedding(
             dataset_name=self.config.dataset_name,
