@@ -75,11 +75,223 @@ from transformers import (
 from speechbrain.inference import EncoderClassifier
 from tqdm import tqdm
 
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+# Debugging helpers: dump a compact summary of the first few collator batches
+from pathlib import Path
+
+_COLLATOR_DEBUG_FILE: Path = Path("collator_debug_batches.jsonl")
+_COLLATOR_DEBUG_COUNT: int = 0
+_COLLATOR_DEBUG_MAX: int = 3
+
+def _safe_shape(obj):
+    try:
+        if obj is None:
+            return None
+        if isinstance(obj, torch.Tensor):
+            return tuple(obj.shape)
+        if isinstance(obj, np.ndarray):
+            return tuple(obj.shape)
+        # list-like
+        if hasattr(obj, "__len__"):
+            if len(obj) == 0:
+                return (0,)
+            first = obj[0]
+            if hasattr(first, "__len__") and not isinstance(first, (str, bytes)):
+                return (len(obj), len(first))
+            return (len(obj),)
+    except Exception:
+        return "unknown"
+    return None
+
+@dataclass
+class SpeechT5DataCollator:
+    processor: SpeechT5Processor
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Drop any examples that ended up with empty input_ids
+        features = [f for f in features if f.get("input_ids")]
+        if not features:
+            # Nothing valid in this batch; let Trainer skip it
+            return {}
+
+        # Drop examples missing audio/spectrogram targets (`speech_values`) —
+        # these can appear if preprocessing produced inconsistent records.
+        missing_speech_count = sum(1 for f in features if not f.get("speech_values"))
+        if missing_speech_count:
+            logger.warning("Dropping %d examples from batch: missing speech_values", missing_speech_count)
+            # Write an immediate debug summary before filtering so we capture the
+            # original batch contents that triggered the drop (this can happen
+            # before the later debug write location when the batch becomes empty).
+            try:
+                import os
+                proc_info = {"pid": os.getpid()}
+                summaries = []
+                for f in features:
+                    summaries.append(
+                        {
+                            "keys": sorted(list(f.keys())),
+                            "has_input_ids": bool(f.get("input_ids")),
+                            "input_ids_len": len(f.get("input_ids")) if f.get("input_ids") else None,
+                            "has_speech_values": bool(f.get("speech_values")),
+                            "speech_values_shape": _safe_shape(f.get("speech_values")),
+                            "has_speaker_embeddings": f.get("speaker_embeddings") is not None,
+                            "speaker_embeddings_len": len(f.get("speaker_embeddings")) if f.get("speaker_embeddings") is not None else None,
+                        }
+                    )
+                with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"drop_dump": True, "proc": proc_info, "batch_size": len(features), "summaries": summaries}) + "\n")
+            except Exception as e:
+                logger.debug("Failed to write immediate collator drop summary: %s", e)
+            features = [f for f in features if f.get("speech_values")]
+
+        if not features:
+            # Nothing valid after removing missing speech_values; skip batch
+            return {}
+
+        # Log the batch structure before padding so we can diagnose missing fields
+        first_feature = features[0]
+        logger.info(
+            "Collator batch: size=%d, keys=%s, input_ids_type=%s, input_ids_len=%s",
+            len(features),
+            sorted(first_feature.keys()),
+            type(first_feature.get("input_ids")).__name__,
+            len(first_feature.get("input_ids")) if first_feature.get("input_ids") is not None else None,
+        )
+
+        # Transient debug: write a compact summary of the first few batches to disk
+        global _COLLATOR_DEBUG_COUNT
+        try:
+            if _COLLATOR_DEBUG_COUNT < _COLLATOR_DEBUG_MAX:
+                # input("Paused at collator; press Enter to continue...")
+                summaries = []
+                for f in features:
+                    s = {
+                        "keys": sorted(list(f.keys())),
+                        "has_input_ids": bool(f.get("input_ids")),
+                        "input_ids_len": len(f.get("input_ids")) if f.get("input_ids") else None,
+                        "has_speech_values": bool(f.get("speech_values")),
+                        "speech_values_shape": _safe_shape(f.get("speech_values")),
+                        "has_speaker_embeddings": f.get("speaker_embeddings") is not None,
+                        "speaker_embeddings_len": len(f.get("speaker_embeddings")) if f.get("speaker_embeddings") is not None else None,
+                    }
+                    summaries.append(s)
+                with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"batch_size": len(features), "summaries": summaries}) + "\n")
+                _COLLATOR_DEBUG_COUNT += 1
+                logger.info(
+                    "Wrote collator debug batch summary to %s (%d/%d)",
+                    str(_COLLATOR_DEBUG_FILE),
+                    _COLLATOR_DEBUG_COUNT,
+                    _COLLATOR_DEBUG_MAX,
+                )
+        except Exception as e:
+            logger.warning("Failed to write collator debug summary: %s", e)
+
+        # Let the processor handle text padding; it expects input_ids/attention_mask in each feature
+        try:
+            # Only pad the text-related fields with the tokenizer.
+            # Don't pass `speech_values` here — those are audio arrays and
+            # will break the tokenizer's tensor conversion.
+            text_batch = self.processor.tokenizer.pad(
+                [
+                    {"input_ids": f["input_ids"], "attention_mask": f.get("attention_mask")}
+                    for f in features
+                ],
+                padding=True,
+                return_tensors="pt",
+            )
+        except Exception as exc:
+            logger.error(
+                "processor.pad failed: first_feature=%s, feature_count=%d",
+                {k: type(v).__name__ for k, v in first_feature.items()},
+                len(features),
+            )
+            raise
+
+        # Speaker embeddings: list[list[float]] -> tensor [B, emb_dim]
+        speaker_embs = torch.tensor(
+            [f["speaker_embeddings"] for f in features],
+            dtype=torch.float32,
+        )
+
+        # Speech values (mel-spectrograms): all should be same size [n_mels=80, n_frames]
+        # Convert to [batch, n_frames, n_mels] for SpeechT5 prenet
+        speech_seqs = []
+        for f in features:
+            # f["speech_values"] is a list of lists (80, frames)
+            # Convert to tensor and ensure shape
+            mel_spec = torch.as_tensor(f["speech_values"], dtype=torch.float32)
+            # Verify it's 2D
+            if mel_spec.ndim != 2:
+                raise ValueError(f"Expected 2D mel-spec, got {mel_spec.ndim}D with shape {mel_spec.shape}")
+            speech_seqs.append(mel_spec)
+
+        # All mel-specs should have same shape (80, n_frames) since preprocessing pads uniformly
+        # Stack and transpose: (batch, 80, frames) -> (batch, frames, 80)
+        if len(speech_seqs) > 0:
+            stacked_speech = torch.stack(speech_seqs, dim=0)  # (batch, 80, frames)
+            padded_speech = stacked_speech.transpose(1, 2)  # (batch, frames, 80)
+        else:
+            # Empty batch
+            padded_speech = torch.zeros((len(speech_seqs), 102, 80), dtype=torch.float32)
+
+        batch: Dict[str, Union[torch.Tensor, Any]] = {
+            "input_ids": text_batch["input_ids"],
+            "speaker_embeddings": speaker_embs,
+            "labels": padded_speech,
+        }
+
+        if "attention_mask" in text_batch:
+            batch["attention_mask"] = text_batch["attention_mask"]
+
+        return batch
+        
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def compute_mel_spectrogram(waveform: np.ndarray, sr: int = 16000) -> np.ndarray:
+    """
+    Compute mel-spectrogram from waveform using librosa.
+    Returns mel-spectrogram with shape (n_mels=80, n_frames).
+    
+    Args:
+        waveform: audio waveform (numpy array, shape [n_samples])
+        sr: sampling rate
+    
+    Returns:
+        mel-spectrogram (numpy array, shape [80, time_steps])
+    """
+    if not HAS_LIBROSA:
+        raise ImportError("librosa is required for mel-spectrogram computation. Install it with: pip install librosa")
+    
+    # Compute mel-spectrogram with SpeechT5 defaults
+    # n_mels=80, n_fft=400, hop_length=160 (for 16kHz)
+    mel_spec = librosa.feature.melspectrogram(
+        y=waveform,
+        sr=sr,
+        n_mels=80,
+        n_fft=400,
+        hop_length=160,
+        fmin=0,
+        fmax=8000,
+    )
+    
+    # Convert to log scale
+    mel_spec = np.log(np.maximum(mel_spec, 1e-9))
+    
+    return mel_spec
 
 
 def trim_silence_energy(x, sr, frame_ms=30, hop_ms=10, rel_db=-45.0, pad_ms=0):
@@ -246,7 +458,6 @@ def load_csv_dataset(
     dataset = Dataset.from_pandas(df)
     return dataset
 
-
 def preprocess_function(
     examples,
     processor,
@@ -258,22 +469,41 @@ def preprocess_function(
     max_target_length: int = 8000,
 ):
     """Preprocess examples for SpeechT5 training."""
+    # We need to preserve the input batch length when using batched=True with
+    # `datasets.Dataset.map`. Return lists that align with the original examples
+    # so downstream components won't receive misaligned/missing fields.
+    n = len(examples[text_column])
+
+    out_input_ids = [[] for _ in range(n)]
+    out_attention_mask = [[] for _ in range(n)]
+    out_speaker_embeddings = [None for _ in range(n)]
+    out_speech_values = [None for _ in range(n)]
 
     valid_texts = []
     valid_speeches = []
     valid_speaker_embeddings = []
+    valid_indices = []
 
-    for text, audio_path, speaker_label in zip(
-        examples[text_column],
-        examples[audio_column],
-        examples[speaker_column],
+    skipped_audio = 0
+    skipped_speaker = 0
+    skipped_text = 0
+    skipped_error = 0
+
+    for i, (text, audio_path, speaker_label) in enumerate(
+        zip(examples[text_column], examples[audio_column], examples[speaker_column])
     ):
         try:
+            if not text or str(text).strip() == "":
+                skipped_text += 1
+                continue
+
             if not os.path.exists(audio_path):
+                skipped_audio += 1
                 logger.warning(f"Audio not found: {audio_path}")
                 continue
 
             if speaker_label not in speaker_embeddings:
+                skipped_speaker += 1
                 logger.warning(f"No embedding for speaker: {speaker_label}")
                 continue
 
@@ -291,51 +521,84 @@ def preprocess_function(
             if len(speech) > max_target_length:
                 speech = speech[:max_target_length]
 
+            valid_indices.append(i)
             valid_texts.append(text)
             valid_speeches.append(speech)
             valid_speaker_embeddings.append(speaker_embeddings[speaker_label])
 
         except Exception as e:
+            skipped_error += 1
             logger.warning(f"Error processing {audio_path}: {e}")
             continue
 
-    if not valid_texts:
-        return {
-            "input_ids": [],
-            "attention_mask": [],
-            "speaker_embeddings": [],
-            "speech_values": [],
-        }
-
-    text_inputs = processor(
-        text=valid_texts,
-        padding=True,
-        truncation=True,
-    ) # return_tensors="pt",
-
-    speech_inputs = processor(
-        audio=valid_speeches,
-        sampling_rate=sr,
-        padding=True,
-        max_length=max_target_length,
-        truncation=True,
-    ) # return_tensors="pt",
-
-    speech_key = "input_features" if "input_features" in speech_inputs else "input_values"
-
-    speaker_embeddings_tensor = torch.tensor(
-        np.array(valid_speaker_embeddings),
-        dtype=torch.float32,
+    total_examples = n
+    logger.info(
+        "Preprocess batch: total=%d, kept=%d, skipped_text=%d, skipped_audio=%d, skipped_speaker=%d, skipped_error=%d",
+        total_examples,
+        len(valid_texts),
+        skipped_text,
+        skipped_audio,
+        skipped_speaker,
+        skipped_error,
     )
 
+    if valid_texts:
+        # Processor returns plain lists when return_tensors is omitted
+        text_inputs = processor(
+            text=valid_texts,
+            padding=True,
+            truncation=True,
+        )
+
+        # Convert waveforms to mel-spectrograms
+        mel_specs = []
+        for speech in valid_speeches:
+            mel_spec = compute_mel_spectrogram(speech, sr=sr)
+            mel_specs.append(mel_spec)
+
+        # Pad mel-spectrograms to a fixed expected length
+        # With hop_length=160, max_target_length samples -> max_mel_frames
+        # Add buffer to account for librosa computation variations
+        expected_mel_frames = (max_target_length // 160) + 2
+        padded_mel_specs = []
+        for mel_spec in mel_specs:
+            # mel_spec shape is (80, time_steps)
+            if mel_spec.shape[1] < expected_mel_frames:
+                pad_width = ((0, 0), (0, expected_mel_frames - mel_spec.shape[1]))
+                mel_spec = np.pad(mel_spec, pad_width, mode='constant', constant_values=-11.0)
+            elif mel_spec.shape[1] > expected_mel_frames:
+                # Truncate if longer
+                mel_spec = mel_spec[:, :expected_mel_frames]
+            padded_mel_specs.append(mel_spec)
+
+        # Map processed valid entries back to their original positions
+        for j, orig_idx in enumerate(valid_indices):
+            # Ensure returned fields are plain Python lists (JSON/Arrow-friendly)
+            iid = text_inputs["input_ids"][j]
+            out_input_ids[orig_idx] = iid.tolist() if hasattr(iid, "tolist") else list(iid)
+            if "attention_mask" in text_inputs:
+                am = text_inputs["attention_mask"][j]
+                out_attention_mask[orig_idx] = am.tolist() if hasattr(am, "tolist") else list(am)
+
+            # Use mel-spectrogram instead of waveform
+            mel_spec = padded_mel_specs[j]
+            out_speech_values[orig_idx] = mel_spec.tolist()
+
+            out_speaker_embeddings[orig_idx] = (
+                valid_speaker_embeddings[j].tolist()
+                if hasattr(valid_speaker_embeddings[j], "tolist")
+                else list(valid_speaker_embeddings[j])
+            )
+
+    # Return aligned lists; invalid positions will have empty/None placeholders
     result = {
-        "input_ids": text_inputs["input_ids"],
-        "speaker_embeddings": speaker_embeddings_tensor,
-        "speech_values": speech_inputs[speech_key],
+        "input_ids": out_input_ids,
+        "speaker_embeddings": out_speaker_embeddings,
+        "speech_values": out_speech_values,
     }
 
-    if "attention_mask" in text_inputs:
-        result["attention_mask"] = text_inputs["attention_mask"]
+    if any(out_attention_mask):
+        result["attention_mask"] = out_attention_mask
 
     return result
 
@@ -503,7 +766,7 @@ def main():
 
     logger.info(f"Loading SpeechT5 model: {args.model_name}")
     processor = SpeechT5Processor.from_pretrained(args.model_name)
-    model = SpeechT5ForTextToSpeech.from_pretrained(args.model_name, dtype=torch.float16 if args.device == "cuda" else torch.float32)
+    model = SpeechT5ForTextToSpeech.from_pretrained(args.model_name, dtype=torch.float32)
     vocoder = SpeechT5HifiGan.from_pretrained(args.vocoder_name)
 
     logger.info(f"Loading training dataset from: {train_path}")
@@ -594,6 +857,52 @@ def main():
         remove_columns=train_dataset.column_names,
     )
 
+    def log_dataset_health(dataset, split_name: str):
+        missing_input_ids = 0
+        missing_speech_values = 0
+        missing_speaker_embeddings = 0
+        missing_attention_mask = 0
+        for row in dataset:
+            if not row.get("input_ids"):
+                missing_input_ids += 1
+            if not row.get("speech_values"):
+                missing_speech_values += 1
+            if row.get("speaker_embeddings") is None:
+                missing_speaker_embeddings += 1
+            if "attention_mask" in row and not row.get("attention_mask"):
+                missing_attention_mask += 1
+
+        logger.info(
+            "%s dataset health: rows=%d, missing_input_ids=%d, missing_speech_values=%d, missing_speaker_embeddings=%d, missing_attention_mask=%d",
+            split_name,
+            len(dataset),
+            missing_input_ids,
+            missing_speech_values,
+            missing_speaker_embeddings,
+            missing_attention_mask,
+        )
+
+        if missing_input_ids or missing_speech_values or missing_speaker_embeddings:
+            logger.warning(
+                "%s has %d problematic rows; inspect preprocessing or source CSV values.",
+                split_name,
+                missing_input_ids + missing_speech_values + missing_speaker_embeddings,
+            )
+
+    log_dataset_health(train_dataset, "Train")
+
+    def filter_valid_rows(example):
+        return bool(example.get("input_ids")) and bool(example.get("speech_values")) and example.get("speaker_embeddings") is not None
+
+    train_valid_count = train_dataset.filter(filter_valid_rows).num_rows
+    if train_valid_count != len(train_dataset):
+        logger.warning(
+            "Filtered train dataset: kept %d/%d valid rows after preprocessing.",
+            train_valid_count,
+            len(train_dataset),
+        )
+    train_dataset = train_dataset.filter(filter_valid_rows)
+
     if val_dataset:
         val_dataset = val_dataset.map(
             preprocess_fn,
@@ -602,6 +911,15 @@ def main():
             desc="Processing validation data",
             remove_columns=val_dataset.column_names,
         )
+        log_dataset_health(val_dataset, "Validation")
+        val_valid_count = val_dataset.filter(filter_valid_rows).num_rows
+        if val_valid_count != len(val_dataset):
+            logger.warning(
+                "Filtered validation dataset: kept %d/%d valid rows after preprocessing.",
+                val_valid_count,
+                len(val_dataset),
+            )
+        val_dataset = val_dataset.filter(filter_valid_rows)
 
     # TrainingArguments in some transformers versions may not accept
     # `evaluation_strategy` as a constructor kwarg. Try to set it and
@@ -623,8 +941,8 @@ def main():
             evaluation_strategy="steps" if val_dataset else "no",
             save_strategy="steps",
             seed=args.seed,
-            fp16=args.mixed_precision == "fp16",
-            bf16=args.mixed_precision == "bf16",
+            fp16=False,
+            bf16=False,
             optim="adamw_8bit" if args.device == "cuda" else "adamw_torch",
             report_to="tensorboard",
         )
@@ -645,20 +963,122 @@ def main():
             save_total_limit=3,
             save_strategy="steps",
             seed=args.seed,
-            fp16=args.mixed_precision == "fp16",
-            bf16=args.mixed_precision == "bf16",
+            fp16=False,
+            bf16=False,
             optim="adamw_8bit" if args.device == "cuda" else "adamw_torch",
             report_to="tensorboard",
         )
 
+    # For debugging, allow forcing dataloader workers to 0 so the collator runs
+    # in the main process (helps with breakpoints/input/pdb). Set the
+    # environment variable `COLLATOR_DEBUG=1` to enable.
+    try:
+        import os
+
+        if os.environ.get("COLLATOR_DEBUG"):
+            training_args.dataloader_num_workers = 0
+            logger.info("COLLATOR_DEBUG enabled — set training_args.dataloader_num_workers=0 for deterministic collator debugging")
+    except Exception:
+        pass
+
     logger.info("Initializing Trainer...")
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        tokenizer=processor,
-    )
+    # Write a compact summary of dataset columns and first rows so we can
+    # verify which keys survive into the Trainer/Dataloader.
+    try:
+        cols = list(train_dataset.column_names)
+        sample_summaries = []
+        for i in range(min(3, len(train_dataset))):
+            row = train_dataset[i]
+            s = {"idx": i, "keys": sorted(list(row.keys()))}
+            for k in s["keys"]:
+                s[f"shape_{k}"] = _safe_shape(row.get(k))
+            sample_summaries.append(s)
+        with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"dataset_columns": cols, "samples": sample_summaries}) + "\n")
+        logger.info("Wrote dataset column/row summary to %s", str(_COLLATOR_DEBUG_FILE))
+    except Exception as e:
+        logger.warning("Failed to write train dataset sample summary: %s", e)
+    data_collator = SpeechT5DataCollator(processor=processor)
+
+    # Wrap HF `datasets.Dataset` in a lightweight torch `Dataset` adapter so
+    # the Trainer/DataLoader will receive dicts unchanged and won't drop
+    # columns via internal dataset formatting/selection logic.
+    from torch.utils.data import Dataset as _TorchDataset
+
+    class _HFDatasetAdapter(_TorchDataset):
+        def __init__(self, hf_ds):
+            self._ds = hf_ds
+            self._getitem_count = 0
+            logger.info("_HFDatasetAdapter init called for dataset of length %d", len(hf_ds))
+            # Write to JSONL immediately to confirm instantiation
+            try:
+                with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"adapter_initialized": True, "ds_len": len(hf_ds)}) + "\n")
+            except Exception:
+                pass
+
+        def __len__(self):
+            return len(self._ds)
+
+        def __getitem__(self, idx):
+            self._getitem_count += 1
+            row = self._ds[int(idx)]
+            # Log EVERY call for the first 20 items
+            if self._getitem_count <= 20:
+                try:
+                    summary = {
+                        "adapter_getitem": {
+                            "call_count": self._getitem_count,
+                            "idx": int(idx),
+                            "has_speech_values": "speech_values" in row,
+                            "keys": sorted(list(row.keys())) if hasattr(row, 'keys') else str(type(row)),
+                        }
+                    }
+                    with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(summary) + "\n")
+                except Exception as e:
+                    try:
+                        with open(_COLLATOR_DEBUG_FILE, "a", encoding="utf-8") as fh:
+                            fh.write(json.dumps({"adapter_getitem_error": str(e)}) + "\n")
+                    except:
+                        pass
+            return row
+            
+            
+    train_dataset_wrapped = _HFDatasetAdapter(train_dataset)
+    val_dataset_wrapped = _HFDatasetAdapter(val_dataset) if val_dataset is not None else None
+    # Build Trainer kwargs dynamically to remain compatible with older
+    # transformers versions that may not accept `remove_unused_columns`.
+    import inspect
+
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": val_dataset,
+        "data_collator": data_collator,
+        "processing_class": processor,  # instead of tokenizer=...
+    }
+
+    try:
+        # In transformers 4.57.0 the Trainer constructor does not accept
+        # remove_unused_columns, so we need to disable it on TrainingArguments.
+        training_args.remove_unused_columns = False
+    except Exception:
+        logger.warning("Could not set training_args.remove_unused_columns=False; this may cause Trainer to drop unused batch columns.")
+
+    try:
+        sig = inspect.signature(Trainer.__init__)
+        if "remove_unused_columns" in sig.parameters:
+            trainer_kwargs["remove_unused_columns"] = False
+    except Exception:
+        # Fallback: don't add the kwarg if inspection fails
+        pass
+
+    logger.info("Trainer will use remove_unused_columns=%s", getattr(training_args, "remove_unused_columns", None))
+
+    # Pass the wrapped datasets to Trainer to avoid HF Dataset column pruning.
+    trainer = Trainer(**{**trainer_kwargs, "train_dataset": train_dataset_wrapped, "eval_dataset": val_dataset_wrapped})
 
     logger.info("Starting training...")
     trainer.train()
